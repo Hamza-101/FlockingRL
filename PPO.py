@@ -555,11 +555,11 @@ print(env.action_space.shape)
 print(env.observation_space.shape)
 
 # Model Training
-model = PPO("MlpPolicy", env, policy_kwargs=policy_kwargs, tensorboard_log="./ppo_Agents_tensorboard/", verbose=1)
-model.set_random_seed(SimulationVariables["ModelSeed"])
+# model = PPO("MlpPolicy", env, policy_kwargs=policy_kwargs, tensorboard_log="./ppo_Agents_tensorboard/", verbose=1)
+# model.set_random_seed(SimulationVariables["ModelSeed"])
 
-model.learn(total_timesteps=SimulationVariables["LearningTimeSteps"],  callback=[progress_callback, adaptive_exploration_callback])
-model.save(rf"{Files['Flocking']}\\Models\\FlockingCombinedNew")
+# model.learn(total_timesteps=SimulationVariables["LearningTimeSteps"],  callback=[progress_callback, adaptive_exploration_callback])
+# model.save(rf"{Files['Flocking']}\\Models\\FlockingCombinedNew")
 
 env = FlockingEnv()
 model = PPO.load(rf'{Files["Flocking"]}\Models\FlockingCombinedNew')
@@ -583,39 +583,62 @@ for episode in tqdm(range(0, SimulationVariables['Episodes'])):
 
     # Initialize dictionaries to store data
     positions_dict = {i: [] for i in range(len(env.agents))}
+    distances_dict = []  # To store distances for all agents at all timesteps
     velocities_dict = {i: [] for i in range(len(env.agents))}
     accelerations_dict = {i: [] for i in range(len(env.agents))}
     trajectory_dict = {i: [] for i in range(len(env.agents))}
 
-    while timestep < min(SimulationVariables["EvalTimeSteps"], 3000):
+    while timestep < min(SimulationVariables["EvalTimeSteps"], 5000):
         actions, state = model.predict(obs)
         obs, reward, done, info = env.step(actions)
         reward_episode.append(reward)
-        
-        for i, agent in enumerate(env.agents):
 
+        # Collect distances for this timestep
+        timestep_distances = {}  # To store distances for this timestep
+        for i, agent in enumerate(env.agents):
+            # Store absolute positions
             positions_dict[i].append(agent.position.tolist())
+
+            # Store velocity and acceleration
             velocity = agent.velocity.tolist()
             velocities_dict[i].append(velocity)
+
             acceleration = agent.acceleration.tolist()
             accelerations_dict[i].append(acceleration)
+
+            # Store trajectory
             trajectory_dict[i].append(agent.position.tolist())
+
+            # Calculate distances to other agents
+            distances = []
+            for j, other_agent in enumerate(env.agents):
+                if i != j:  # Skip the agent itself
+                    distance = np.linalg.norm(np.array(other_agent.position) - np.array(agent.position))
+                    distances.append(distance)
+
+            # Add distances for the current agent
+            timestep_distances[i] = distances
+
+        # Append distances for the current timestep to distances_dict
+        distances_dict.append(timestep_distances)
 
         timestep += 1
         episode_rewards_dict[str(episode)] = reward_episode
 
+    # Save the data for this episode
     with open(os.path.join(positions_directory, f"Episode{episode}_positions.json"), 'w') as f:
         json.dump(positions_dict, f, indent=4)
     with open(os.path.join(positions_directory, f"Episode{episode}_velocities.json"), 'w') as f:
         json.dump(velocities_dict, f, indent=4)
     with open(os.path.join(positions_directory, f"Episode{episode}_accelerations.json"), 'w') as f:
         json.dump(accelerations_dict, f, indent=4)
+    with open(os.path.join(positions_directory, f"Episode{episode}_distances.json"), 'w') as f:
+        json.dump(distances_dict, f, indent=4)  # Save all distances for all agents at all timesteps
     with open(os.path.join(positions_directory, f"Episode{episode}_trajectory.json"), 'w') as f:
         json.dump(trajectory_dict, f, indent=4)
 
     env.counter += 1
     print(sum(reward_episode))
-    
 
 with open(rf"{Results['EpisodalRewards']}.json", 'w') as f:
     json.dump(episode_rewards_dict, f, indent=4)
@@ -623,5 +646,5 @@ with open(rf"{Results['EpisodalRewards']}.json", 'w') as f:
 env.close()
 print("Testing completed")
 
-
 generatePlots()
+generateCombined()
