@@ -1,3 +1,4 @@
+#40 million timestep
 
 import os
 import gym
@@ -14,17 +15,23 @@ from scipy.signal import savgol_filter
 import shutil
 from PlotAnimationRL import *
 import glob
+from scipy.spatial import cKDTree
+from stable_baselines3 import DDPG
+from stable_baselines3.common.noise import NormalActionNoise, OrnsteinUhlenbeckActionNoise
+
 
 th.cuda.is_available = lambda: True
-
 
 positions_directory = "D:\\Thesis_\\FlockingFinal\\Results\\Flocking\\Testing\\Episodes"  
 
 policy_kwargs = dict(
     activation_fn=th.nn.Tanh,  
-    net_arch=[dict(pi=[512, 512, 512, 512, 512, 512, 512, 512], 
-                   vf=[512, 512, 512, 512, 512, 512, 512, 512])]  
+    net_arch=[dict(pi=[512, 512, 512, 512, 512, 512, 512], vf=[512, 512, 512, 512, 512, 512, 512, 512])] 
 )
+
+class Encoder(json.JSONEncoder):
+    def default(self, obj):
+        return json.JSONEncoder.default(self, obj)  
 
 class TQDMProgressCallback(BaseCallback):
     def __init__(self, total_timesteps, verbose=0):
@@ -43,26 +50,23 @@ class TQDMProgressCallback(BaseCallback):
     def _on_training_end(self) -> None:
         if self.pbar:
             self.pbar.close()
-
+  
 class Agent:
     def __init__(self, position):
         
         self.position = np.array(position, dtype=float)
-
         self.acceleration = np.zeros(2)
         self.max_acceleration = SimulationVariables["AccelerationUpperLimit"]
         self.velocity = np.round(np.random.uniform(-SimulationVariables["VelocityUpperLimit"], SimulationVariables["VelocityUpperLimit"], size=2), 2)       
         self.max_velocity = SimulationVariables["VelocityUpperLimit"]
 
     def update(self, action):
-
         self.acceleration += action
         acc_magnitude = np.linalg.norm(self.acceleration)
         if acc_magnitude > 0:  
             if acc_magnitude > SimulationVariables["AccelerationUpperLimit"]:
                 scaled_magnitude = SimulationVariables["AccelerationUpperLimit"] * np.tanh(acc_magnitude / SimulationVariables["AccelerationUpperLimit"])
                 self.acceleration = (self.acceleration / acc_magnitude) * scaled_magnitude
-            
         self.velocity += self.acceleration * SimulationVariables["dt"]
         vel = np.linalg.norm(self.velocity)
         if vel > 0:
@@ -73,16 +77,12 @@ class Agent:
 
         return self.position, self.velocity
 
-class Encoder(json.JSONEncoder):
-    def default(self, obj):
-        return json.JSONEncoder.default(self, obj)  
-
 class FlockingEnv(gym.Env):
     def __init__(self):
-
+        # More episodes to train on
         super(FlockingEnv, self).__init__()
         self.episode=0
-        self.counter=200
+        self.counter=2324
         self.CTDE=False
         self.current_timestep = 0
         self.reward_log = []
@@ -98,19 +98,21 @@ class FlockingEnv(gym.Env):
         min_obs = np.array([-np.inf, -np.inf, -2.5, -2.5] * len(self.agents), dtype=np.float32)
         max_obs = np.array([np.inf, np.inf, 2.5, 2.5] * len(self.agents), dtype=np.float32)
         self.observation_space = spaces.Box(low=min_obs, high=max_obs, dtype=np.float32)
-
+        
     def step(self, actions):
 
         training_rewards = {}
-        noisy_actions = actions + np.random.normal(loc=0, scale=0.5, size=actions.shape)
-        actions = np.clip(noisy_actions, self.action_space.low, self.action_space.high)
 
+        # New Noise
+        noise = NormalActionNoise(mean=np.zeros(len(actions)), sigma=0.5 * np.ones(len(actions)))
+        noisy_actions = actions + noise()
+      
         self.current_timestep += 1
         reward=0
         done=False
         info={}
         
-        observations = self.simulate_agents(actions)
+        observations = self.simulate_agents(noisy_actions)
         reward, out_of_flock = self.calculate_reward() 
 
         if (self.CTDE==False):
@@ -127,19 +129,15 @@ class FlockingEnv(gym.Env):
         return observations, reward, done, info
 
     def reset(self):   
+
         env.seed(SimulationVariables["Seed"])
         self.agents = [Agent(position) for position in self.read_agent_locations()]
-
-        print("\nInitial Agent Positions Reset:")
-        for i, agent in enumerate(self.agents):
-            print(f"Agent {i+1}: Position {agent.position}")
 
         for agent in self.agents:
             agent.acceleration = np.zeros(2)
             agent.velocity = np.round(np.random.uniform(-SimulationVariables["VelocityUpperLimit"], SimulationVariables["VelocityUpperLimit"], size=2), 2)             
 
         observation = self.get_observation().flatten()
-        
         self.current_timestep = 0  
         return observation   
 
@@ -215,12 +213,13 @@ class FlockingEnv(gym.Env):
             cumulative_cohesion += cohesion_reward
 
             total_reward += agent_reward
-
-        with open(os.path.join(positions_directory, f"CohesionRewardsEpisode{env.episode}.json"), "a") as f:
-            f.write(f"{cumulative_cohesion} \n")
             
-        with open(os.path.join(positions_directory, f"AlignmentRewardsEpisode{env.episode}.json"), "a") as f:
-            f.write(f"{cumulative_alignment} \n")
+        if(self.CTDE==True):
+            with open(os.path.join(positions_directory, f"CohesionRewardsEpisode{env.episode}.json"), "a") as f:
+                f.write(f"{cumulative_cohesion} \n")
+                
+            with open(os.path.join(positions_directory, f"AlignmentRewardsEpisode{env.episode}.json"), "a") as f:
+                f.write(f"{cumulative_alignment} \n")
 
         return total_reward, out_of_flock
 
@@ -229,7 +228,8 @@ class FlockingEnv(gym.Env):
             AlignmentReward = 0
             total_reward = 0
             outofflock = False
-            midpoint = 4
+                    # Define the midpoint
+            midpoint = (SimulationVariables["SafetyRadius"] + SimulationVariables["NeighborhoodRadius"]) / 2
 
             if len(neighbor_positions) > 0:
                 for neighbor_position in neighbor_positions:
@@ -243,7 +243,7 @@ class FlockingEnv(gym.Env):
 
                     elif midpoint < distance <= SimulationVariables["NeighborhoodRadius"]:
                         CohesionReward += 10 - (10 / (SimulationVariables["NeighborhoodRadius"] - midpoint)) * (distance - midpoint)
-        
+
                     average_velocity = np.mean(neighbor_velocities, axis = 0)
                     dot_product = np.dot(average_velocity, agent.velocity)
                     norm_product = np.linalg.norm(average_velocity) * np.linalg.norm(agent.velocity)
@@ -277,7 +277,8 @@ class FlockingEnv(gym.Env):
     def seed(self, seed=SimulationVariables["Seed"]):
         self.np_random, _ = gym.utils.seeding.np_random(seed)
         return [seed]
-#------------------------
+#-----------------Training examples 
+
 
 def delete_files(): 
     Paths = [
@@ -310,99 +311,6 @@ def delete_files():
 
     print("All specified files have been deleted.")
 
-def generate_combined():
-    """
-    Generate and save plots for each episode as individual PNG files and a combined plot for all episodes
-    for both alignment and cohesion rewards.
-    """
-    positions_directory = "Results/Flocking/Testing/Episodes"
-    os.makedirs(positions_directory, exist_ok=True)  # Create directory for plots if it doesn't exist
-
-    # Initialize Combined Plots
-    fig_combined, (ax1_combined, ax2_combined) = plt.subplots(2, 1, figsize=(12, 16))
-    ax1_combined_secondary = ax1_combined.twiny()
-    ax2_combined_secondary = ax2_combined.twiny()
-
-    # Process files for each episode
-    cohesion_files = sorted([f for f in os.listdir(positions_directory) if f.startswith("CohesionRewardsEpisode")])
-    alignment_files = sorted([f for f in os.listdir(positions_directory) if f.startswith("AlignmentRewardsEpisode")])
-
-    for cohesion_file, alignment_file in zip(cohesion_files, alignment_files):
-        episode = cohesion_file.split("CohesionRewardsEpisode")[1].split(".json")[0]
-
-        # Load rewards from files
-        with open(os.path.join(positions_directory, cohesion_file), "r") as f:
-            cohesion_rewards = [float(line.strip()) for line in f.readlines()][:200]
-        with open(os.path.join(positions_directory, alignment_file), "r") as f:
-            alignment_rewards = [float(line.strip()) for line in f.readlines()][:200]
-
-        timesteps = range(1, len(cohesion_rewards) + 1)
-        seconds = [timestep * 0.1 for timestep in timesteps]
-
-        # Individual Episode Plot
-        fig, ax1 = plt.subplots(2, 1, figsize=(10, 12))
-        ax1_secondary = ax1[0].twiny()
-        ax2_secondary = ax1[1].twiny()
-
-        # Cohesion plot
-        ax1[0].plot(timesteps, cohesion_rewards, label=f"Cohesion (Episode {episode})", alpha=0.7, color="blue")
-        ax1[0].set_title(f"Cohesion Rewards - Episode {episode}")
-        ax1[0].set_xlabel("Timestep")
-        ax1[0].set_ylabel("Reward")
-        ax1[0].legend()
-        ax1[0].grid(True)
-        ax1_secondary.set_xticks(ax1[0].get_xticks())
-        ax1_secondary.set_xticklabels([f"{tick * 0.1:.1f}" for tick in ax1[0].get_xticks()])
-        ax1_secondary.set_xlabel("Time (seconds)")
-
-        # Alignment plot
-        ax1[1].plot(timesteps, alignment_rewards, label=f"Alignment (Episode {episode})", alpha=0.7, color="green")
-        ax1[1].set_title(f"Alignment Rewards - Episode {episode}")
-        ax1[1].set_xlabel("Timestep")
-        ax1[1].set_ylabel("Reward")
-        ax1[1].legend()
-        ax1[1].grid(True)
-        ax2_secondary.set_xticks(ax1[1].get_xticks())
-        ax2_secondary.set_xticklabels([f"{tick * 0.1:.1f}" for tick in ax1[1].get_xticks()])
-        ax2_secondary.set_xlabel("Time (seconds)")
-
-        # Save Individual Episode Plot
-        plt.tight_layout()
-        plt.savefig(os.path.join(positions_directory, f"Episode_{episode}_Rewards.png"), dpi=300)
-        plt.close(fig)
-
-        # Add to Combined Plots
-        ax1_combined.plot(timesteps, cohesion_rewards, label=f"Cohesion (Episode {episode})", alpha=0.7)
-        ax2_combined.plot(timesteps, alignment_rewards, label=f"Alignment (Episode {episode})", alpha=0.7)
-
-    # Combined Plot Formatting
-    ax1_combined.set_title("Cohesion Rewards - All Episodes")
-    ax1_combined.set_xlabel("Timestep")
-    ax1_combined.set_ylabel("Reward")
-    ax1_combined.legend()
-    ax1_combined.grid(True)
-    ax1_combined_secondary.set_xticks(ax1_combined.get_xticks())
-    ax1_combined_secondary.set_xticklabels([f"{tick * 0.1:.1f}" for tick in ax1_combined.get_xticks()])
-    ax1_combined_secondary.set_xlabel("Time (seconds)")
-
-    ax2_combined.set_title("Alignment Rewards - All Episodes")
-    ax2_combined.set_xlabel("Timestep")
-    ax2_combined.set_ylabel("Reward")
-    ax2_combined.legend()
-    ax2_combined.grid(True)
-    ax2_combined_secondary.set_xticks(ax2_combined.get_xticks())
-    ax2_combined_secondary.set_xticklabels([f"{tick * 0.1:.1f}" for tick in ax2_combined.get_xticks()])
-    ax2_combined_secondary.set_xlabel("Time (seconds)")
-
-    # Save Combined Plot
-    plt.tight_layout()
-    combined_plot_path = os.path.join(positions_directory, "Combined_Cohesion_Alignment_Rewards.png")
-    plt.savefig(combined_plot_path, dpi=300)
-    plt.close(fig_combined)
-
-    print(f"Plots saved in directory: {positions_directory}")
-    print(f"Combined plot saved at: {combined_plot_path}")
-
 def setup_episode_folder(episode_name):
     episode_folder = os.path.join(positions_directory, episode_name)
     if os.path.exists(episode_folder):
@@ -414,9 +322,108 @@ def setup_episode_folder(episode_name):
 
 positions_directory = "D:\\Thesis_\\FlockingFinal\\Results\\Flocking\\Testing\\Episodes" 
 
+def generate_combined():
+    """
+    Generate and save plots for each episode as individual PNG files and a combined plot for all episodes.
+    Plots include cohesion, alignment, combined rewards, and a secondary x-axis in seconds.
+    Adjusted for 6 agents.
+    """
+    directory = "Results/Flocking/Testing/Episodes"
+    os.makedirs(directory, exist_ok=True)  # Create directory for plots if it doesn't exist
+
+    # Initialize Combined Plot
+    fig_combined, ax_combined = plt.subplots(figsize=(12, 8))
+    ax_combined_seconds = ax_combined.twiny()  # Add secondary x-axis for seconds
+
+    # Get all cohesion and alignment files
+    cohesion_files = sorted([f for f in os.listdir(directory) if f.startswith("CohesionRewardsEpisode")])
+    alignment_files = sorted([f for f in os.listdir(directory) if f.startswith("AlignmentRewardsEpisode")])
+
+    # Match episodes dynamically
+    episodes = sorted(set(
+        f.split("CohesionRewardsEpisode")[1].split(".json")[0] for f in cohesion_files
+    ).intersection(
+        f.split("AlignmentRewardsEpisode")[1].split(".json")[0] for f in alignment_files
+    ))
+
+    if not episodes:
+        print("No valid episodes found!")
+        return
+
+    for episode in episodes:
+        cohesion_file = os.path.join(directory, f"CohesionRewardsEpisode{episode}.json")
+        alignment_file = os.path.join(directory, f"AlignmentRewardsEpisode{episode}.json")
+
+        # Add file existence check
+        if not os.path.exists(cohesion_file) or not os.path.exists(alignment_file):
+            print(f"Skipping missing files for Episode {episode}")
+            continue
+
+        # Load rewards for 6 agents and limit to 200 timesteps
+        with open(cohesion_file, "r") as f:
+            cohesion_rewards = [float(line.strip()) for line in f.readlines()][:200]
+        with open(alignment_file, "r") as f:
+            alignment_rewards = [float(line.strip()) for line in f.readlines()][:200]
+
+        # Calculate combined rewards
+        combined_rewards = [c + a for c, a in zip(cohesion_rewards, alignment_rewards)]
+
+        timesteps = range(1, len(combined_rewards) + 1)
+        seconds = [timestep / 10 for timestep in timesteps]  # Convert timesteps to seconds (10 timesteps = 1 second)
+
+        # Individual Episode Plot
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax_seconds = ax.twiny()  # Add secondary x-axis for seconds
+
+        # Plot rewards
+        ax.plot(timesteps, cohesion_rewards, label="Cohesion Rewards", alpha=0.7, linestyle='--')
+        ax.plot(timesteps, alignment_rewards, label="Alignment Rewards", alpha=0.7, linestyle='-.')
+        ax.plot(timesteps, combined_rewards, label="Combined Rewards", alpha=0.7)
+
+        # Format the primary x-axis (timesteps)
+        ax.set_title(f"Rewards for Episode {episode}")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Reward")
+        ax.legend()
+        ax.grid(True)
+
+        # Format the secondary x-axis (seconds)
+        ax.set_xlim(1, 200)
+        ax_seconds.set_xlim(ax.get_xlim())
+        ax_seconds.set_xticks(ax.get_xticks())
+        ax_seconds.set_xticklabels([f"{tick / 10:.1f}" for tick in ax.get_xticks()])
+        ax_seconds.set_xlabel("Time (seconds)")
+
+        # Save Individual Episode Plot
+        plt.tight_layout()
+        plt.savefig(os.path.join(positions_directory, f"Episode_{episode}_Rewards.png"), dpi=300)
+        plt.close(fig)
+
+        # Add to Combined Plot
+        ax_combined.plot(timesteps, combined_rewards, label=f"Combined Rewards (Episode {episode})", alpha=0.5)
+
+    # Format Combined Plot
+    ax_combined.set_title("Combined Rewards - All Episodes (200 Timesteps)")
+    ax_combined.set_xlabel("Timestep")
+    ax_combined.set_ylabel("Reward")
+    ax_combined.legend()
+    ax_combined.grid(True)
+
+    # Format the secondary x-axis (seconds) for the combined plot
+    ax_combined.set_xlim(1, 200)
+    ax_combined_seconds.set_xlim(ax_combined.get_xlim())
+    ax_combined_seconds.set_xticks(ax_combined.get_xticks())
+    ax_combined_seconds.set_xticklabels([f"{tick / 10:.1f}" for tick in ax_combined.get_xticks()])
+    ax_combined_seconds.set_xlabel("Time (seconds)")
+
+    # Save Combined Plot
+    plt.tight_layout()
+    combined_plot_path = os.path.join(positions_directory, "Combined_Cohesion_Alignment_Rewards.png")
+    plt.savefig(combined_plot_path, dpi=300)
+    plt.close(fig_combined)
+    
 def generateVelocity(episode, episode_folder):
     velocities_dict = {}
-
     velocity_file_path = os.path.join(positions_directory, f"Episode{episode}_velocities.json")
     
     if not os.path.exists(velocity_file_path):
@@ -426,32 +433,33 @@ def generateVelocity(episode, episode_folder):
     with open(velocity_file_path, 'r') as f:
         episode_velocities = json.load(f)
 
-    for agent_id in range(3):
+    for agent_id in range(6):  # Adjusted to work with 6 agents
         velocities_dict.setdefault(agent_id, []).extend(episode_velocities.get(str(agent_id), []))
 
-    colors = ['blue', 'orange', 'green']  
-
+    # Use matplotlib's color map to generate distinct colors
+    colors = plt.cm.get_cmap('tab10', 6)  # This will give us 6 distinct colors from the 'tab10' colormap
     downsample_factor = 10  
-    for agent_id in range(3):
-        plt.figure(figsize=(10, 5))
-        plt.clf()
 
+    plt.figure(figsize=(12, 6))
+    plt.clf()
+    
+    for agent_id in range(6):  # Adjusted to work with 6 agents
         agent_velocities = np.array(velocities_dict[agent_id])
         agent_velocities = savgol_filter(agent_velocities, window_length=3, polyorder=2, axis=0)  
         velocities_magnitude = np.sqrt(agent_velocities[:, 0]**2 + agent_velocities[:, 1]**2)
         
-        plt.plot(velocities_magnitude[::downsample_factor], label=f"Agent {agent_id+1}", color=colors[agent_id], linewidth=0.5)
-        
-        plt.title(f"Velocity - Episode {episode} - Agent {agent_id+1}")
-        plt.xlabel("Time Step")
-        plt.ylabel("Velocity Magnitude")
-        plt.ylim([0, 5])  
-        plt.legend()
-        plt.grid(True)
-        
-        plt.savefig(os.path.join(episode_folder, f"Agent_{agent_id+1}_Velocity.png"))
-        plt.close()  
-        print(f"Velocity plot saved for Episode {episode}, Agent {agent_id+1}")
+        plt.plot(velocities_magnitude[::downsample_factor], label=f"Agent {agent_id+1}", color=colors(agent_id), linewidth=1)
+
+    plt.title(f"Velocity - Episode {episode}")
+    plt.xlabel("Time Step")
+    plt.ylabel("Velocity Magnitude")
+    plt.ylim([0, 5])  
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(episode_folder, f"Episode_{episode}_Velocity.png"))
+    plt.close()  
+    print(f"Velocity plot saved for Episode {episode}")
 
 def generateAcceleration(episode, episode_folder):
     acceleration_file_path = os.path.join(positions_directory, f"Episode{episode}_accelerations.json")
@@ -463,29 +471,30 @@ def generateAcceleration(episode, episode_folder):
     with open(acceleration_file_path, 'r') as f:
         episode_accelerations = json.load(f)
 
-    colors = ['blue', 'orange', 'green']  
-
+    # Use matplotlib's color map for consistent coloring
+    colors = plt.cm.get_cmap('tab10', 6)
     downsample_factor = 10  
-    for agent_id in range(3):
-        plt.figure(figsize=(10, 5))
-        plt.clf()
 
+    plt.figure(figsize=(12, 6))
+    plt.clf()
+
+    for agent_id in range(6):
         agent_accelerations = np.array(episode_accelerations[str(agent_id)])
         smoothed_accelerations = np.sqrt(agent_accelerations[:, 0]**2 + agent_accelerations[:, 1]**2)
         smoothed_accelerations = savgol_filter(smoothed_accelerations, window_length=15, polyorder=3, axis=0)  
 
-        plt.plot(smoothed_accelerations[::downsample_factor], label=f"Agent {agent_id+1}", color=colors[agent_id], linewidth=0.5)
+        plt.plot(smoothed_accelerations[::downsample_factor], label=f"Agent {agent_id+1}", color=colors(agent_id), linewidth=1)
 
-        plt.title(f"Acceleration - Episode {episode} - Agent {agent_id+1}")
-        plt.xlabel("Time Step")
-        plt.ylabel("Acceleration Magnitude")
-        plt.ylim([0, 10])  
-        plt.legend()
-        plt.grid(True)
-
-        plt.savefig(os.path.join(episode_folder, f"Agent_{agent_id+1}_Acceleration.png"))
-        plt.close()  
-        print(f"Acceleration plot saved for Episode {episode}, Agent {agent_id+1}")
+    plt.title(f"Acceleration - Episode {episode}")
+    plt.xlabel("Time Step")
+    plt.ylabel("Acceleration Magnitude")
+    plt.ylim([0, 10])  
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(episode_folder, f"Episode_{episode}_Acceleration.png"))
+    plt.close()  
+    print(f"Acceleration plot saved for Episode {episode}")
 
 def generatePlots():
     for episode in range(SimulationVariables["Episodes"]):
@@ -523,8 +532,11 @@ class LossCallback(BaseCallback):
 
         return True
 
+        #ent_coeff = 0.17
+        #Fix max_reward_threshold
+
 class AdaptiveExplorationCallback(BaseCallback):
-    def __init__(self, initial_ent_coef=0.15, min_ent_coef=1e-10, decay_rate=0.95, max_reward_threshold=20, verbose=0):
+    def __init__(self, initial_ent_coef=0.40, min_ent_coef=1e-10, decay_rate=0.85, max_reward_threshold=60, verbose=0):
         super(AdaptiveExplorationCallback, self).__init__(verbose)
         self.initial_ent_coef = initial_ent_coef       
         self.min_ent_coef = min_ent_coef               
@@ -571,19 +583,14 @@ loss_callback = LossCallback()
 adaptive_exploration_callback = AdaptiveExplorationCallback()
 progress_callback = TQDMProgressCallback(total_timesteps=SimulationVariables["LearningTimeSteps"])
 
-get_system_info()
-print(env.action_space.shape)
-print(env.observation_space.shape)
+device = "cuda" if th.cuda.is_available() else "cpu"
 
 # Model Training
-# model = PPO("MlpPolicy", env, policy_kwargs=policy_kwargs, tensorboard_log="./ppo_Agents_tensorboard/", verbose=1)
-# model.set_random_seed(SimulationVariables["ModelSeed"])
+model = PPO("MlpPolicy", env, device=device, policy_kwargs=policy_kwargs, tensorboard_log="./ppo_flocking_tensorboard/", verbose=1)
+model.set_random_seed(SimulationVariables["ModelSeed"])
 
-# model.learn(total_timesteps=SimulationVariables["LearningTimeSteps"],  callback=[progress_callback, adaptive_exploration_callback])
-# model.save(rf"{Files['Flocking']}\\Models\\FlockingCombinedNew")
-
-velocities_for_episode_2 = np.array([[0.0, 2.5], [-2.5, -2.5], [2.5, 0.0]])
-velocities_for_episode_3 = np.array([[2.5, 0.0], [-2.5, 0.0], [-2.5, 1.0]])
+model.learn(total_timesteps=SimulationVariables["LearningTimeSteps"],  callback=[progress_callback, adaptive_exploration_callback])
+model.save(rf"{Files['Flocking']}\\Models\\FlockingCombinedNew")
 
 env = FlockingEnv()
 model = PPO.load(rf'{Files["Flocking"]}\Models\FlockingCombinedNew')
@@ -615,16 +622,6 @@ for episode in tqdm(range(0, SimulationVariables["Episodes"])):
     
     print(f"\n--- Episode {episode} ---")  
     print(env.counter)
-
-    if episode == 1:  
-        for i, agent in enumerate(env.agents):
-            agent.velocity = velocities_for_episode_2[i]
-            print(f"Agent {i+1} initial velocity for Episode 2: {agent.velocity}")
-    elif episode == 2:  # Third episode
-        for i, agent in enumerate(env.agents):
-            agent.velocity = velocities_for_episode_3[i]
-            print(f"Agent {i+1} initial velocity for Episode 3: {agent.velocity}")
-
 
     for i, agent in enumerate(env.agents):
         accelerations_dict[i].append(agent.acceleration.tolist())
@@ -677,7 +674,6 @@ with open(rf"{Results['EpisodalRewards']}.json", 'w') as f:
     json.dump(episode_rewards_dict, f, indent=4)
 
 env.close()
-print("Testing completed")
 
 generatePlots()
 generate_combined()
